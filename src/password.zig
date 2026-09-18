@@ -51,7 +51,8 @@ pub const PasswordBook = struct {
                 while (it.next()) |line| try self.push(line);
             } else |_| {}
         }
-        for ([_][]const u8{ "123456", "password", "12345678", "123456789", "12345", "qwerty", "abc123", "111111", "000000", "iloveyou", "acgs", "绮梦", "qym" }) |p| try self.push(p);
+        // Community/common passwords first (most likely hits, cheapest rejects)
+        for ([_][]const u8{ "acgs", "绮梦", "qym", "123456", "password", "12345678", "123456789", "12345", "qwerty", "abc123", "111111", "000000", "iloveyou" }) |p| try self.push(p);
     }
 
     pub fn gatherContext(self: *PasswordBook, archive_path: []const u8) !void {

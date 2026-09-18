@@ -106,101 +106,129 @@ pub const Engine = struct {
         if (processed.contains(path)) return;
         try processed.put(path, {});
 
-        // Module 2: Sniff real carrier
-        const sr = sniffer.sniffFile(self.alloc, path) catch return;
-        if (sr == null) {
+        // Module 2: Sniff real carrier — collect all plausible candidates
+        const cands = sniffer.sniffFileAll(self.alloc, path) catch return;
+        defer self.alloc.free(cands);
+        if (cands.len == 0) {
             // Not an archive at all — deliver as-is
             self.report.kept += 1;
             self.emit(.{ .event = .kept, .path = path, .depth = depth, .fmt = .none, .aux = 0 });
             self.deliverFile(path, out_dir) catch {};
             return;
         }
-        const sniff = sr.?;
-        self.emit(.{ .event = .sniffed, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = sniff.offset });
-
-        // Materialize disguised carrier if needed
-        var actual_path: []const u8 = path;
-        var free_actual = false;
-        defer if (free_actual) self.alloc.free(actual_path);
-        if (sniff.disguised) {
-            actual_path = try sniffer.sliceToFile(self.alloc, path, sniff.offset, out_dir, "_stripped_");
-            free_actual = true;
-        }
-
-        // Multi-volume: numeric split archives (.7z.001/.001) cannot be opened by the
-        // 7z handler directly — concatenate volumes into one temp file instead.
-        var volcat_path: ?[]u8 = null;
-        defer if (volcat_path) |p| self.alloc.free(p);
-        if (vol_deps.len > 0 and util.endsWithNumericSplit(util.basename(path))) {
-            volcat_path = self.concatVolumes(path, vol_deps, out_dir) catch null;
-            if (volcat_path) |cp| {
-                actual_path = cp;
-                free_actual = true;
-            }
-        }
-
-        // Map format to 7z handler
-        const ext_str = switch (sniff.fmt) {
-            .zip => "zip",
-            .rar4, .rar5 => "rar",
-            .sevenz => "7z",
-            .gz => "gz",
-            .bz2 => "bz2",
-            .xz => "xz",
-            .tar => "tar",
-            .cab => "cab",
-            .none => unreachable,
-        };
-        const clsid = self.lib.findHandler(self.alloc, ext_str) catch {
-            self.report.kept += 1;
-            self.emit(.{ .event = .kept, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
-            return;
-        };
-        if (clsid == null) {
-            self.report.kept += 1;
-            self.emit(.{ .event = .kept, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
-            return;
-        }
-
-        // Module 3: Probe for encryption
-        self.emit(.{ .event = .probe, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
 
         var current_password: ?[]const u8 = null;
+        var probe_result: ?ffi.ProbeResult = null;
+        var chosen_fmt: types.Format = .none;
+        var chosen_clsid: ?com.GUID = null;
+        var chosen_actual: []const u8 = path;
+        var chosen_free = false;
+        defer if (chosen_free) {
+            ioctx.cwd().deleteFile(ioctx.io(), chosen_actual) catch {};
+            self.alloc.free(chosen_actual);
+        };
+        defer if (probe_result) |pr| {
+            for (pr.entries) |e| self.alloc.free(e.path);
+            self.alloc.free(pr.entries);
+        };
 
-        // Probe without a password first; if the archive has encrypted headers
-        // (e.g. 7z -mhe=on) the open itself fails, so retry with book candidates.
-        const probe_result = blk: {
-            if (self.lib.probe(self.alloc, actual_path, clsid.?, vol_deps, null)) |pr| {
-                break :blk pr;
-            } else |_| {
-                // Harvest password hints from files next to the archive (readme/说明/key/.txt)
-                self.book.gatherContext(path) catch {};
-                for (self.book.candidates.items) |cand| {
-                    if (self.lib.probe(self.alloc, actual_path, clsid.?, vol_deps, cand)) |pr| {
-                        current_password = cand;
-                        self.report.passwords_used += 1;
-                        break :blk pr;
-                    } else |_| {}
+        var volcat_path: ?[]u8 = null;
+        defer if (volcat_path) |p| self.alloc.free(p);
+
+        // Try every sniff candidate until one opens as a valid archive.
+        // Deliver nothing until an archive is positively identified.
+        for (cands) |cand| {
+            self.emit(.{ .event = .sniffed, .path = path, .depth = depth, .fmt = cand.fmt, .aux = cand.offset });
+
+            // Materialize disguised carrier if needed
+            var actual_path: []const u8 = path;
+            var free_actual = false;
+            if (cand.disguised) {
+                actual_path = sniffer.sliceToFile(self.alloc, path, cand.offset, out_dir, "_stripped_") catch continue;
+                free_actual = true;
+            }
+
+            // Multi-volume: numeric split archives (.7z.001/.001) cannot be opened
+            // by the 7z handler directly — concatenate volumes into one temp file.
+            if (vol_deps.len > 0 and util.endsWithNumericSplit(util.basename(path))) {
+                if (volcat_path == null) volcat_path = self.concatVolumes(path, vol_deps, out_dir) catch null;
+                if (volcat_path) |cp| {
+                    if (free_actual) ioctx.cwd().deleteFile(ioctx.io(), actual_path) catch {};
+                    actual_path = cp;
+                    free_actual = false;
                 }
             }
-            // Not a valid archive (false-positive sniff or unopenable) — keep as-is.
+
+            // Map format to 7z handler. Rar (v4) and Rar5 share the "rar"
+            // extension — disambiguate via the handler's signature bytes.
+            const ext_str: ?[]const u8 = switch (cand.fmt) {
+                .zip => "zip",
+                .rar4, .rar5 => "rar",
+                .sevenz => "7z",
+                .gz => "gz",
+                .bz2 => "bz2",
+                .xz => "xz",
+                .tar => "tar",
+                .cab => "cab",
+                .none => null,
+            };
+            const sig_want: ?[]const u8 = switch (cand.fmt) {
+                .rar4 => "Rar",
+                .rar5 => "Rar5",
+                else => null,
+            };
+            const clsid = if (ext_str) |es| self.lib.findHandlerSig(self.alloc, es, sig_want) catch null else null;
+            if (clsid == null) {
+                if (free_actual) ioctx.cwd().deleteFile(ioctx.io(), actual_path) catch {};
+                continue;
+            }
+
+            self.emit(.{ .event = .probe, .path = path, .depth = depth, .fmt = cand.fmt, .aux = cand.offset });
+
+            // Probe without a password first; if the archive has encrypted
+            // headers (e.g. 7z -mhe=on) the open itself fails, so retry with
+            // password-book candidates.
+            const pr = blk: {
+                if (self.lib.probe(self.alloc, actual_path, clsid.?, vol_deps, null)) |p| {
+                    break :blk p;
+                } else |_| {}
+                for (self.book.candidates.items) |cand_pw| {
+                    if (self.lib.probe(self.alloc, actual_path, clsid.?, vol_deps, cand_pw)) |p| {
+                        current_password = cand_pw;
+                        self.report.passwords_used += 1;
+                        break :blk p;
+                    } else |_| {}
+                }
+                break :blk null;
+            };
+
+            if (pr == null) {
+                // This candidate is not a valid archive — try the next sniff hit.
+                if (free_actual) ioctx.cwd().deleteFile(ioctx.io(), actual_path) catch {};
+                continue;
+            }
+
+            probe_result = pr;
+            chosen_fmt = cand.fmt;
+            chosen_clsid = clsid;
+            chosen_actual = actual_path;
+            chosen_free = free_actual;
+            break;
+        }
+
+        const pr = probe_result orelse {
+            // Every candidate exhausted — keep the original file as-is.
             self.report.kept += 1;
-            self.emit(.{ .event = .kept, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
+            self.emit(.{ .event = .kept, .path = path, .depth = depth, .fmt = .none, .aux = 0 });
             self.deliverFile(path, out_dir) catch {};
-            // Clean up the materialized disguised-carrier temp file if any.
-            if (free_actual) ioctx.cwd().deleteFile(ioctx.io(), actual_path) catch {};
             self.report.errors += 1;
             return;
         };
-        defer {
-            for (probe_result.entries) |e| self.alloc.free(e.path);
-            self.alloc.free(probe_result.entries);
-        }
-
-        const needs_pass = probe_result.any_encrypted or current_password != null;
+        const sniff_fmt = chosen_fmt;
+        const actual_path = chosen_actual;
 
         // Module 4: Extract
-        self.emit(.{ .event = .extracting, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
+        self.emit(.{ .event = .extracting, .path = path, .depth = depth, .fmt = sniff_fmt, .aux = 0 });
 
         const depth_dir = try util.allocPrint(self.alloc, "{s}/_{d}_{s}", .{ out_dir, depth, util.basename(path) });
         defer self.alloc.free(depth_dir);
@@ -208,48 +236,50 @@ pub const Engine = struct {
 
         // Extract
         const bomb_limit: u64 = if (self.opts.max_ratio > 0) self.opts.max_total_bytes else 0;
-        var already_extracted = false;
 
-        if (needs_pass) {
-            // Content may be encrypted even when headers are not — harvest hints too.
-            if (current_password == null) self.book.gatherContext(path) catch {};
-            for (self.book.candidates.items) |candidate| {
-                const test_arc = self.lib.openArchive(self.alloc, actual_path, clsid.?, vol_deps, candidate) catch continue;
-                var extracted_ok = true;
-                _ = test_arc.extractAll(.{
-                    .out_dir = depth_dir,
-                    .bomb_limit = bomb_limit,
-                    .password = candidate,
-                }) catch {
-                    extracted_ok = false;
-                };
-                test_arc.close();
-                self.alloc.destroy(test_arc);
-                if (extracted_ok) {
-                    // Correct password — contents already extracted into depth_dir.
-                    already_extracted = true;
-                    self.report.archives += 1;
-                    self.emit(.{ .event = .extracted, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
-                    current_password = candidate;
-                    self.book.learn(candidate) catch {};
-                    self.report.passwords_used += 1;
-                    break;
-                }
-                // Wrong password — wipe partial output and try the next candidate.
-                ioctx.cwd().deleteTree(ioctx.io(), depth_dir) catch {};
-                ioctx.cwd().createDirPath(ioctx.io(), depth_dir) catch {};
-            }
-            if (!already_extracted and self.opts.interactive) {
-                // Ask user
-                if (self.evcb) |cb| {
-                    if (cb.need_password) |nf| {
-                        var buf: [256]u8 = undefined;
-                        if (nf(path, &buf, cb.user)) |pw| {
-                            current_password = try self.alloc.dupe(u8, pw);
-                            self.book.learn(pw) catch {};
-                            self.report.passwords_used += 1;
-                        }
+        const needs_pass = pr.any_encrypted or current_password != null;
+        var verified_extract = false;
+        if (needs_pass and current_password == null) {
+            // Zip-style: headers readable but entries encrypted — the only sound
+            // check is a real extraction attempt (wrong password → CRC error).
+            // A successful attempt leaves the content extracted; skip re-extract.
+            if (pr.any_encrypted) {
+                for (self.book.candidates.items) |candidate| {
+                    const arc = self.lib.openArchive(self.alloc, actual_path, chosen_clsid.?, vol_deps, candidate) catch continue;
+                    var ok = true;
+                    _ = arc.extractAll(.{
+                        .out_dir = depth_dir,
+                        .bomb_limit = bomb_limit,
+                        .password = candidate,
+                    }) catch {
+                        ok = false;
+                    };
+                    arc.close();
+                    self.alloc.destroy(arc);
+                    if (ok) {
+                        current_password = candidate;
+                        verified_extract = true;
+                        self.report.passwords_used += 1;
+                        self.report.archives += 1;
+                        self.emit(.{ .event = .extracted, .path = path, .depth = depth, .fmt = sniff_fmt, .aux = 0 });
+                        break;
                     }
+                    // Wipe partial output of the wrong-password attempt.
+                    ioctx.cwd().deleteTree(ioctx.io(), depth_dir) catch {};
+                    ioctx.cwd().createDirPath(ioctx.io(), depth_dir) catch {};
+                }
+            } else {
+                // rar5-style: encrypted headers — the probe itself validates the
+                // password (block CRC), so retry probe with book candidates.
+                for (self.book.candidates.items) |candidate| {
+                    if (self.lib.probe(self.alloc, actual_path, chosen_clsid.?, vol_deps, candidate)) |pr2| {
+                        current_password = candidate;
+                        self.report.passwords_used += 1;
+                        for (pr.entries) |e| self.alloc.free(e.path);
+                        self.alloc.free(pr.entries);
+                        probe_result = pr2;
+                        break;
+                    } else |_| {}
                 }
             }
             if (current_password == null) {
@@ -258,9 +288,9 @@ pub const Engine = struct {
             }
         }
 
-        if (!already_extracted) {
+        if (!verified_extract) {
             // Open archive
-            const arc = self.lib.openArchive(self.alloc, actual_path, clsid.?, vol_deps, current_password) catch {
+            const arc = self.lib.openArchive(self.alloc, actual_path, chosen_clsid.?, vol_deps, current_password) catch {
                 self.report.errors += 1;
                 if (current_password) |cp| self.alloc.free(cp);
                 return;
@@ -278,7 +308,7 @@ pub const Engine = struct {
             arc.close();
             self.alloc.destroy(arc);
             self.report.archives += 1;
-            self.emit(.{ .event = .extracted, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
+            self.emit(.{ .event = .extracted, .path = path, .depth = depth, .fmt = sniff_fmt, .aux = 0 });
             if (current_password) |cp| self.alloc.free(cp);
         }
 
@@ -357,9 +387,10 @@ pub const Engine = struct {
         const stat = try src_file.stat(io);
         if (stat.size == 0) return;
         var pos: u64 = 0;
-        var buf: [1 << 16]u8 = undefined;
+        const buf = try self.alloc.alloc(u8, 1 << 23);
+        defer self.alloc.free(buf);
         while (pos < stat.size) {
-            const n = try src_file.readPositional(io, &.{&buf}, pos);
+            const n = try src_file.readPositional(io, &.{buf}, pos);
             if (n == 0) break;
             try dst_file.writePositionalAll(io, buf[0..n], pos);
             pos += n;
@@ -392,9 +423,10 @@ pub const Engine = struct {
                 defer dst_file.close(io);
                 const stat = try src_file.stat(io);
                 var pos: u64 = 0;
-                var buf: [1 << 16]u8 = undefined;
+                const buf = try self.alloc.alloc(u8, 1 << 23);
+                defer self.alloc.free(buf);
                 while (pos < stat.size) {
-                    const n = src_file.readPositional(io, &.{&buf}, pos) catch break;
+                    const n = src_file.readPositional(io, &.{buf}, pos) catch break;
                     if (n == 0) break;
                     dst_file.writePositionalAll(io, buf[0..n], pos) catch break;
                     pos += n;

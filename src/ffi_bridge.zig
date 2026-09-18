@@ -60,6 +60,13 @@ pub const Lib = struct {
     }
 
     pub fn findHandler(self: *const Lib, alloc: std.mem.Allocator, ext_want: []const u8) !?com.GUID {
+        return self.findHandlerSig(alloc, ext_want, null);
+    }
+
+    /// Find a handler by extension. When sig_want is provided, the handler's
+    /// kpidSignature must start with those bytes (used to disambiguate the
+    /// Rar (v4) vs Rar5 handlers, which share the "rar" extension).
+    pub fn findHandlerSig(self: *const Lib, alloc: std.mem.Allocator, ext_want: []const u8, sig_want: ?[]const u8) !?com.GUID {
         _ = self;
         const lib = loadLib() orelse return error.BackendMissing;
         const gnf = getProcAddress(lib, "GetNumberOfFormats") orelse return error.BackendMissing;
@@ -82,6 +89,21 @@ pub const Lib = struct {
             var tok_it = std.mem.tokenizeScalar(u8, ext_utf8, ' ');
             while (tok_it.next()) |tok| { if (util.eqlNoCase(tok, ext_want)) { matched = true; break; } }
             if (matched) {
+                // Optional disambiguation by handler name (Rar vs Rar5 share "rar" ext)
+                if (sig_want) |name_want| {
+                    var pv_name: com.PROPVARIANT = .{ .vt = 0, .data = .{ .bVal = 0 } };
+                    if (com.succeeded(ghp_fn(i, @intFromEnum(com.NArchive.NHandlerPropID.name), &pv_name))) {
+                        defer propClear(&pv_name);
+                        if (pv_name.vt == 8) {
+                            if (pv_name.data.bstrVal) |name_bstr| {
+                                const wlen2 = bstrLen(@ptrCast(name_bstr));
+                                const nm = try std.unicode.utf16LeToUtf8Alloc(alloc, name_bstr[0..wlen2]);
+                                defer alloc.free(nm);
+                                if (!util.eqlNoCase(nm, name_want)) continue;
+                            } else continue;
+                        } else continue;
+                    } else continue;
+                }
                 // kpidClassID returns raw 16-byte GUID as BSTR (not a string!)
                 var pv_cls: com.PROPVARIANT = .{ .vt = 0, .data = .{ .bVal = 0 } };
                 if (com.succeeded(ghp_fn(i, @intFromEnum(com.NArchive.NHandlerPropID.class_id), &pv_cls))) {
@@ -220,6 +242,39 @@ pub const Archive = struct {
         if (cb.first_error) |e| return e;
         if (!com.succeeded(hr)) return error.Fail;
         return .{ .files = cb.files_written, .bytes = cb.total_written };
+    }
+
+    /// Verify a password by test-decrypting a single entry (testMode=1:
+    /// full decrypt+CRC in memory, nothing written). Fast entry-level check
+    /// for zip-style archives whose headers are readable without a password.
+    pub fn testPassword(self: *Archive, index: u32, password: ?[]const u8) bool {
+        const cb = self.alloc.create(ExtractCB) catch return false;
+        cb.* = .{
+            .alloc = self.alloc,
+            .io = ioctx.io(),
+            .refcount = std.atomic.Value(u32).init(1),
+            .out_dir = "",
+            .bomb_limit = 0,
+            .total_written = 0,
+            .files_written = 0,
+            .bomb_tripped = false,
+            .first_error = null,
+            .cur_file = null,
+            .cur_pos = 0,
+            .entries = &.{},
+            .password = password,
+            .out_dir_z = self.alloc.dupeZ(u8, "") catch {
+                self.alloc.destroy(cb);
+                return false;
+            },
+        };
+        defer self.alloc.free(cb.out_dir_z);
+        defer self.alloc.destroy(cb);
+
+        var idx = index;
+        const hr = self.vt.Extract(self.handle, @ptrCast(&idx), 1, 1, @ptrCast(cb));
+        if (cb.first_error != null) return false;
+        return com.succeeded(hr);
     }
 
     pub fn close(self: *Archive) void {
@@ -588,7 +643,6 @@ const OpenCallback = struct {
 
     fn qi(p: *anyopaque, riid: *const com.GUID, out: *?*anyopaque) callconv(com.cc_com) com.HRESULT {
         const self: *OpenCallback = @ptrCast(@alignCast(p));
-        // COM rule: QueryInterface must AddRef the returned interface.
         if (riid.eql(com.IID_IArchiveOpenCallback)) { out.* = p; _ = addRef(p); return com.S_OK; }
         if (riid.eql(com.IID_IArchiveOpenVolumeCallback)) { const v: *anyopaque = @ptrCast(&self.vol); out.* = v; _ = volAddRef(v); return com.S_OK; }
         if (riid.eql(com.IID_ICryptoGetTextPassword)) { const v: *anyopaque = @ptrCast(&self.crypto); out.* = v; _ = cryptoAddRef(v); return com.S_OK; }
@@ -696,7 +750,9 @@ const OpenCallback = struct {
     fn cryptoGetTextPassword(p: *anyopaque, password: *?[*]u16) callconv(com.cc_com) com.HRESULT {
         const self: *OpenCallback = @fieldParentPtr("crypto", @as(*CryptoPart, @ptrCast(@alignCast(p))));
         password.* = null;
-        const pw = self.password orelse return com.E_FAIL; // no password available
+        const pw = self.password orelse {
+            return com.E_FAIL;
+        }; // no password available
         const w = std.unicode.utf8ToUtf16LeAllocZ(std.heap.c_allocator, pw) catch return com.E_OUTOFMEMORY;
         defer std.heap.c_allocator.free(w);
         password.* = sysAllocString(w);
