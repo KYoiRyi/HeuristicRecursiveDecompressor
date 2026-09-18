@@ -1,0 +1,19 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+
+# Test / benchmark outputs
+test_out*/
+bench_out*/
+out/
+out_perf/
+bench_final*/
+
+# Large benchmark samples (regenerate with tools/generate_samples*.py or your own)
+bench_samples/big5g.zip
+bench_samples/steg5g.bin
+
+# Temp
+*.pdb
+_volcat_*
+_stripped_*

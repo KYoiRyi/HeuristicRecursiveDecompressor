@@ -1,0 +1,17 @@
+LIBRARY 7z
+EXPORTS
+    CreateDecoder
+    CreateEncoder
+    CreateObject
+    GetHandlerProperty
+    GetHandlerProperty2
+    GetHashers
+    GetIsArc
+    GetMethodProperty
+    GetModuleProp
+    GetNumberOfFormats
+    GetNumberOfMethods
+    SetCaseSensitive
+    SetCodecs
+    SetLargePageMode
+    SetLargePageMode2
