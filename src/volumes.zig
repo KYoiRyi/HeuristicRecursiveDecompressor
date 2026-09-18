@@ -117,7 +117,12 @@ pub fn group(alloc: std.mem.Allocator, paths: []const []const u8) !GroupResult {
     var map = std.HashMap([]const u8, *std.ArrayList(Item), MapCtx, 75).init(alloc);
     defer {
         var it = map.valueIterator();
-        while (it.next()) |v| v.*.deinit(alloc);
+        while (it.next()) |v| {
+            v.*.deinit(alloc);
+            alloc.destroy(v.*);
+        }
+        var kit = map.keyIterator();
+        while (kit.next()) |k| alloc.free(k.*);
         map.deinit();
     }
     var singles = std.ArrayList([]const u8).empty;
@@ -133,6 +138,8 @@ pub fn group(alloc: std.mem.Allocator, paths: []const []const u8) !GroupResult {
             const lst = try alloc.create(std.ArrayList(Item));
             lst.* = .empty;
             gop.value_ptr.* = lst;
+        } else {
+            alloc.free(info.base); // key already owns the first copy
         }
         try gop.value_ptr.*.append(alloc, .{ .path = p, .info = info });
     }

@@ -73,6 +73,11 @@ pub const Engine = struct {
 
         // Module 1: Volume aggregation
         const gr = try volumes.group(self.alloc, all_files.items);
+        defer {
+            for (gr.groups) |g| self.alloc.free(g.deps);
+            self.alloc.free(gr.groups);
+            self.alloc.free(gr.singles);
+        }
         var processed_paths = std.StringHashMap(void).init(self.alloc);
         defer processed_paths.deinit();
 
@@ -117,6 +122,7 @@ pub const Engine = struct {
             return;
         }
 
+        // Points into self.book.candidates (book-owned; freed by book.deinit).
         var current_password: ?[]const u8 = null;
         var probe_result: ?ffi.ProbeResult = null;
         var chosen_fmt: types.Format = .none;
@@ -292,7 +298,6 @@ pub const Engine = struct {
             // Open archive
             const arc = self.lib.openArchive(self.alloc, actual_path, chosen_clsid.?, vol_deps, current_password) catch {
                 self.report.errors += 1;
-                if (current_password) |cp| self.alloc.free(cp);
                 return;
             };
 
@@ -309,7 +314,6 @@ pub const Engine = struct {
             self.alloc.destroy(arc);
             self.report.archives += 1;
             self.emit(.{ .event = .extracted, .path = path, .depth = depth, .fmt = sniff_fmt, .aux = 0 });
-            if (current_password) |cp| self.alloc.free(cp);
         }
 
         // Module 4b: Recursive scan of extracted contents
@@ -324,6 +328,7 @@ pub const Engine = struct {
         }) |entry| {
             if (entry.kind == .file) {
                 const child = try util.join(self.alloc, &.{ depth_dir, entry.path });
+                defer self.alloc.free(child);
                 self.processEntry(child, out_dir, depth + 1, processed, &.{}) catch {};
             }
         }

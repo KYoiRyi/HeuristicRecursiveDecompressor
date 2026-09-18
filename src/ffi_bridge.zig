@@ -785,10 +785,53 @@ fn propClear(pv: *com.PROPVARIANT) void {
     if (pv.vt == 8) { if (pv.data.bstrVal) |b| sysFreeString(b); }
     pv.vt = 0;
 }
-extern "oleaut32" fn SysFreeString(bstr: ?[*]u16) void;
-fn sysFreeString(b: ?[*]u16) void { SysFreeString(b); }
-extern "oleaut32" fn SysAllocStringLen(str: ?[*]const u16, len: u32) ?[*]u16;
-fn sysAllocString(w: []const u16) ?[*]u16 { return SysAllocStringLen(w.ptr, @intCast(w.len)); }
+// BSTR memory must come from the same allocator the host DLL uses for
+// SysAllocString/SysFreeString (COM contract) — a mismatched allocator causes
+// heap corruption on free. Resolve oleaut32 lazily at runtime so there is no
+// import-table reference at all; on non-Windows, fall back to a self-contained
+// BSTR (p7zip uses malloc-backed BSTRs, identical to c_allocator).
+var ole_aut: ?*anyopaque = null;
+var ole_alloc: ?*const fn (?[*]const u16, u32) callconv(.c) ?[*]u16 = null;
+var ole_free: ?*const fn (?[*]u16) callconv(.c) void = null;
+var ole_once = std.atomic.Value(bool).init(false);
+
+fn oleInit() void {
+    if (comptime @import("builtin").os.tag == .windows) {
+        const mod = Lib.LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("oleaut32.dll").ptr) orelse return;
+        ole_aut = mod;
+        const a = Lib.GetProcAddress(mod, "SysAllocStringLen") orelse return;
+        const f = Lib.GetProcAddress(mod, "SysFreeString") orelse return;
+        ole_alloc = @ptrCast(@alignCast(a));
+        ole_free = @ptrCast(@alignCast(f));
+    }
+}
+
+fn oleCallOnce() void {
+    if (ole_once.load(.acquire)) return;
+    oleInit();
+    ole_once.store(true, .release);
+}
+
+const bstr_header_len = 4;
+fn sysAllocString(w: []const u16) ?[*]u16 {
+    oleCallOnce();
+    if (ole_alloc) |f| return f(w.ptr, @intCast(w.len));
+    const raw = std.heap.c_allocator.alignedAlloc(u8, .@"8", bstr_header_len + w.len * 2 + 2) catch return null;
+    const raw_ptr = raw.ptr;
+    std.mem.writeInt(u32, raw_ptr[0..4], @intCast(w.len * 2), .little);
+    const data: [*]u16 = @ptrCast(@alignCast(raw_ptr + bstr_header_len));
+    @memcpy(data[0..w.len], w);
+    data[w.len] = 0;
+    return data;
+}
+fn sysFreeString(b: ?[*]u16) void {
+    const data = b orelse return;
+    oleCallOnce();
+    if (ole_free) |f| { f(data); return; }
+    const raw_ptr: [*]u8 = @ptrCast(data - bstr_header_len / @sizeOf(u16));
+    const raw_len = bstr_header_len + (std.mem.readInt(u32, raw_ptr[0..4], .little)) + 2;
+    std.heap.c_allocator.free(@as([]align(8) u8, @alignCast(raw_ptr[0..raw_len])));
+}
 
 fn parseGuid(s: []const u8) ?com.GUID {
     const hv = struct { fn f(c: u8) ?u4 { return switch (c) { '0'...'9' => @intCast(c - '0'), 'a'...'f' => @intCast(c - 'a' + 10), 'A'...'F' => @intCast(c - 'A' + 10), else => null }; } }.f;

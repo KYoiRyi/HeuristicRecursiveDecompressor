@@ -43,6 +43,7 @@ pub fn main() !void {
         defer it.deinit();
 
     var inputs = std.ArrayList([]const u8).empty;
+    defer inputs.deinit(a);
     var output_dir: ?[]const u8 = null;
     var max_depth: u32 = 8;
     var max_ratio: u32 = 100;
