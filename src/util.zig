@@ -97,7 +97,13 @@ pub fn fmtBytes(buf: []u8, n: u64) []const u8 {
 }
 
 pub fn tokensFromText(alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
-    var it = std.mem.tokenizeAny(u8, text, " \t\r\n,;\"'`<>[](){}|");
+    // Separators include fullwidth CJK punctuation (matched at byte level — the
+    // individual UTF-8 bytes of（）：！etc. act as delimiters, which cleanly
+    // splits ASCII tokens embedded in CJK text).
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n,;\"'`<>[](){}|" ++
+        "\xEF\xBC\x88\xEF\xBC\x89\xEF\xBC\x9A\xEF\xBC\x8C\xEF\xBC\x81\xEF\xBC\x9F" ++ // （）：！？
+        "\xE3\x80\x90\xE3\x80\x91\xE3\x80\x82\xE3\x80\x81\xE3\x80\x8A\xE3\x80\x8B" ++ // 【】。、《》
+        "\xEF\xBC\x8B\xEF\xBC\x9D\xE3\x80\x9C\xEF\xBD\x9E"); // ＋＝~～
     while (it.next()) |tok0| {
         var tok = tok0;
         while (tok.len > 0 and isTrimPunct(tok[tok.len - 1])) tok = tok[0 .. tok.len - 1];

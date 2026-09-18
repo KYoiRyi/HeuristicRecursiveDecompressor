@@ -17,3 +17,5 @@ bench_samples/steg5g.bin
 *.pdb
 _volcat_*
 _stripped_*
+down1_out/
+bench_final*/

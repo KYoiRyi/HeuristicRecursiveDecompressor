@@ -51,7 +51,7 @@ pub const PasswordBook = struct {
                 while (it.next()) |line| try self.push(line);
             } else |_| {}
         }
-        for ([_][]const u8{ "123456", "password", "12345678", "123456789", "12345", "qwerty", "abc123", "111111", "000000", "iloveyou" }) |p| try self.push(p);
+        for ([_][]const u8{ "123456", "password", "12345678", "123456789", "12345", "qwerty", "abc123", "111111", "000000", "iloveyou", "acgs", "绮梦", "qym" }) |p| try self.push(p);
     }
 
     pub fn gatherContext(self: *PasswordBook, archive_path: []const u8) !void {
@@ -80,6 +80,10 @@ pub const PasswordBook = struct {
     }
 
     fn dedupeInPlace(self: *PasswordBook) void {
+        // Local seen: self.seen already contains every legit candidate pushed via
+        // push(), so checking against it would delete all of them.
+        var local_seen = std.StringHashMap(void).init(self.alloc);
+        defer local_seen.deinit();
         var i: usize = 0;
         while (i < self.candidates.items.len) {
             const c = self.candidates.items[i];
@@ -88,12 +92,12 @@ pub const PasswordBook = struct {
                 _ = self.candidates.orderedRemove(i);
                 continue;
             }
-            if (self.seen.contains(c)) {
+            if (local_seen.contains(c)) {
                 self.alloc.free(@constCast(c));
                 _ = self.candidates.orderedRemove(i);
                 continue;
             }
-            self.seen.put(c, {}) catch {};
+            local_seen.put(c, {}) catch {};
             i += 1;
         }
     }

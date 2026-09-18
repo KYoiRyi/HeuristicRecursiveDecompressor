@@ -116,7 +116,9 @@ pub const Lib = struct {
         const vt: *const com.IInArchiveVt = com.vt(com.IInArchiveVt, obj.?);
         const open_hr = vt.Open(obj.?, stream, null, open_cb);
         _ = com.vt(com.IArchiveOpenCallbackVt, open_cb).base.Release(open_cb);
-        if (!com.succeeded(open_hr)) {
+        // Only S_OK means fully opened. S_FALSE (partial open / wrong password on
+        // encrypted headers) must be treated as failure.
+        if (open_hr != com.S_OK) {
             _ = FileInStream.release(@ptrCast(stream)); com.release(&obj); return error.NotArchive;
         }
         var num: u32 = 0;

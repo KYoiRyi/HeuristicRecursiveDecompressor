@@ -173,6 +173,8 @@ pub const Engine = struct {
             if (self.lib.probe(self.alloc, actual_path, clsid.?, vol_deps, null)) |pr| {
                 break :blk pr;
             } else |_| {
+                // Harvest password hints from files next to the archive (readme/说明/key/.txt)
+                self.book.gatherContext(path) catch {};
                 for (self.book.candidates.items) |cand| {
                     if (self.lib.probe(self.alloc, actual_path, clsid.?, vol_deps, cand)) |pr| {
                         current_password = cand;
@@ -181,6 +183,12 @@ pub const Engine = struct {
                     } else |_| {}
                 }
             }
+            // Not a valid archive (false-positive sniff or unopenable) — keep as-is.
+            self.report.kept += 1;
+            self.emit(.{ .event = .kept, .path = path, .depth = depth, .fmt = sniff.fmt, .aux = 0 });
+            self.deliverFile(path, out_dir) catch {};
+            // Clean up the materialized disguised-carrier temp file if any.
+            if (free_actual) ioctx.cwd().deleteFile(ioctx.io(), actual_path) catch {};
             self.report.errors += 1;
             return;
         };
@@ -203,6 +211,8 @@ pub const Engine = struct {
         var already_extracted = false;
 
         if (needs_pass) {
+            // Content may be encrypted even when headers are not — harvest hints too.
+            if (current_password == null) self.book.gatherContext(path) catch {};
             for (self.book.candidates.items) |candidate| {
                 const test_arc = self.lib.openArchive(self.alloc, actual_path, clsid.?, vol_deps, candidate) catch continue;
                 var extracted_ok = true;
